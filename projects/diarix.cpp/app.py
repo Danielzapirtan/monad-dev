@@ -21,11 +21,13 @@ import io
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import torch
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -85,7 +87,10 @@ VALID_LANGUAGES = {"auto", "de", "en", "fr", "ro"}
 # --------------------------------------------------------------------------
 
 def _empty_transcription_status():
-    return {"state": "idle", "completed": 0, "total": 0, "error": None}
+    return {
+        "state": "idle", "completed": 0, "total": 0, "current_file": None,
+        "file_progress": None, "error": None,
+    }
 
 
 def reset_transcription_state(sess):
@@ -468,7 +473,7 @@ def run_faster_whisper(path, language, device, model_size):
     return [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
 
 
-def run_whisper_cpp(path, language, model_size, device):
+def run_whisper_cpp(path, language, model_size, device, progress_callback=None):
     """Transcribe with the whisper.cpp CLI using its GGML model files."""
     repo_dir = os.path.expanduser(os.environ.get(
         "WHISPER_CPP_DIR", "~/code/Danielzapirtan/whisper.cpp"
@@ -523,13 +528,55 @@ def run_whisper_cpp(path, language, model_size, device):
                 "-t", str(max(1, min(os.cpu_count() or 4, 8))),
                 "-oj",
                 "-of", output_base,
-                "-np",
+                "-pp",
             ]
             if device == "cpu":
                 cmd.append("-ng")
-            subprocess.run(
-                cmd, capture_output=True, text=True, timeout=1800, check=True
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
             )
+            output_queue = queue.Queue()
+
+            def read_output():
+                while True:
+                    chunk = os.read(process.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    output_queue.put(chunk)
+                output_queue.put(None)
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            output_tail = bytearray()
+            progress_tail = b""
+            deadline = time.monotonic() + 1800
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    process.kill()
+                    process.wait()
+                    raise subprocess.TimeoutExpired(cmd, 1800)
+                try:
+                    chunk = output_queue.get(timeout=min(1, remaining))
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+
+                output_tail.extend(chunk)
+                if len(output_tail) > 65536:
+                    del output_tail[:-65536]
+                progress_data = progress_tail + chunk
+                for match in re.finditer(rb"progress\s*=\s*(\d{1,3})%", progress_data):
+                    if progress_callback:
+                        progress_callback(min(100, int(match.group(1))))
+                progress_tail = progress_data[-64:]
+
+            return_code = process.wait()
+            if return_code:
+                raise subprocess.CalledProcessError(
+                    return_code, cmd, output=output_tail.decode(errors="replace")
+                )
 
             json_path = f"{output_base}.json"
             if not os.path.isfile(json_path):
@@ -561,7 +608,10 @@ def run_whisper_cpp(path, language, model_size, device):
         raise RuntimeError(f"Failed to parse whisper.cpp output: {exc}") from exc
 
 
-def _transcribe_file_unlocked(path, engine, language, device, model_size, hf_token=None, diarize=False):
+def _transcribe_file_unlocked(
+    path, engine, language, device, model_size, hf_token=None, diarize=False,
+    progress_callback=None,
+):
     # Normalize "auto" and unknown codes to None for the Python engines.
     lang = normalize_language(language)
     if engine == "openai-whisper":
@@ -569,16 +619,19 @@ def _transcribe_file_unlocked(path, engine, language, device, model_size, hf_tok
     if engine == "faster":
         return run_faster_whisper(path, lang, device, model_size)
     if engine == "whisper.cpp":
-        return run_whisper_cpp(path, lang, model_size, device)
+        return run_whisper_cpp(path, lang, model_size, device, progress_callback)
     raise RuntimeError(f"Unknown transcription engine '{engine}'.")
 
 
-def transcribe_file(path, engine, language, device, model_size, hf_token=None, diarize=False):
+def transcribe_file(
+    path, engine, language, device, model_size, hf_token=None, diarize=False,
+    progress_callback=None,
+):
     """Transcribe one file, resolving platform-specific device names."""
     def _run():
         return _transcribe_file_unlocked(
             path, engine, language, transcription_device(engine, device), model_size,
-            hf_token=hf_token, diarize=diarize,
+            hf_token=hf_token, diarize=diarize, progress_callback=progress_callback,
         )
 
     if uses_gpu_device(engine, device):
@@ -628,14 +681,14 @@ def apply_diarization_to_segments(
 def transcribe_one_source_file(
     f, engine, language, device, model_size,
     diarize, diarize_method, ai_provider, api_key, num_speakers,
-    engine_override=None, device_override=None,
+    engine_override=None, device_override=None, progress_callback=None,
 ):
     """Full per-file pipeline used by multi-file mode."""
     selected_engine = engine_override or engine
     selected_device = device_override or device
     segs = transcribe_file(
         f["path"], selected_engine, language, selected_device, model_size,
-        hf_token=api_key, diarize=False,
+        hf_token=api_key, diarize=False, progress_callback=progress_callback,
     )
     norm_segs = normalize_segments(segs)
     apply_diarization_to_segments(
@@ -671,9 +724,21 @@ def run_multifile_transcriptions(
 
     def work(idx, f):
         try:
+            with sess["lock"]:
+                sess["transcription_status"].update(
+                    current_file=f.get("name"), file_progress=None,
+                )
+
+            def report_progress(percent):
+                with sess["lock"]:
+                    sess["transcription_status"].update(
+                        current_file=f.get("name"), file_progress=percent,
+                    )
+
             result = transcribe_one_source_file(
                 f, engine, language, device, model_size,
                 diarize, diarize_method, ai_provider, api_key, num_speakers,
+                progress_callback=report_progress,
             )
             return idx, result, None
         except Exception as exc:
@@ -1485,8 +1550,9 @@ def api_transcribe():
         sess["transcriptions"] = []
         sess["transcript"] = None
         sess["transcription_status"] = {
+            **_empty_transcription_status(),
             "state": "running", "completed": 0,
-            "total": len(source_files) if is_multifile else 1, "error": None,
+            "total": len(source_files) if is_multifile else 1,
         }
 
     # ---- multi-file path: one transcription per source file, NOT concatenated ----
@@ -1526,10 +1592,25 @@ def api_transcribe():
         "start": 0.0, "path": sess["source"]["path"],
     }]
     sources = sorted(sources, key=lambda c: c.get("start", 0.0))
+    current_file = (
+        source_files[0].get("name") if source_files
+        else os.path.basename(sess["source"]["path"])
+    )
+    with sess["lock"]:
+        sess["transcription_status"].update(
+            current_file=current_file, file_progress=None,
+        )
 
     def _transcribe_item(item):
+        def report_progress(percent):
+            with sess["lock"]:
+                sess["transcription_status"].update(
+                    current_file=current_file, file_progress=percent,
+                )
+
         segs = transcribe_file(
-            item["path"], engine, language, device, model_size
+            item["path"], engine, language, device, model_size,
+            progress_callback=report_progress,
         )
         offset = item.get("start", 0.0)
         out = []
@@ -2018,6 +2099,13 @@ textarea#transcriptOut{flex:1; min-height:220px; resize:vertical; font-family:va
   min-height:160px; resize:vertical; font-family:var(--font-mono); font-size:12.5px; line-height:1.6;
 }
 
+.transcription-progress{display:flex; flex-direction:column; gap:8px; padding:10px 24px 0;}
+.transcription-progress-label{font-size:12.5px; color:var(--text-dim);}
+.progress-track{height:8px; overflow:hidden; border-radius:999px; background:var(--panel-2);}
+.progress-fill{height:100%; width:0; border-radius:inherit; background:var(--amber); transition:width .25s ease;}
+.progress-fill.indeterminate{width:35%; animation:progress-slide 1.4s ease-in-out infinite alternate;}
+@keyframes progress-slide{from{transform:translateX(0);}to{transform:translateX(185%);}}
+
 .toast{
   position:fixed; bottom:18px; left:50%; transform:translateX(-50%) translateY(10px);
   background:#20120f; border:1px solid var(--red); color:#ffd8d6; padding:11px 18px;
@@ -2057,6 +2145,13 @@ footer{flex:0 0 auto; padding:9px 22px; text-align:center; font-size:11px; color
         <button class="tab-btn" data-tab="cut" disabled><span class="eyebrow">02</span>Preview &amp; cut</button>
         <button class="tab-btn" data-tab="transcribe" disabled><span class="eyebrow">03</span>Transcription</button>
         <button class="tab-btn" data-tab="extract" disabled><span class="eyebrow">04</span>Results</button>
+      </div>
+      <div id="transcriptionProgress" class="transcription-progress" aria-live="polite">
+        <div id="transcriptionProgressLabel" class="transcription-progress-label"></div>
+        <div class="progress-track" role="progressbar" aria-label="Transcription progress"
+             aria-valuemin="0" aria-valuemax="100">
+          <div id="transcriptionProgressBar" class="progress-fill"></div>
+        </div>
       </div>
 
       <!-- TAB 1: load media -->
@@ -2909,6 +3004,56 @@ function updateDiarizeUI(){
 }
 updateDiarizeUI();
 
+function updateTranscriptionProgress(status){
+  const container = document.getElementById('transcriptionProgress');
+  const label = document.getElementById('transcriptionProgressLabel');
+  const bar = document.getElementById('transcriptionProgressBar');
+  const track = bar.parentElement;
+  if (!status || status.state === 'idle') {
+    container.classList.add('hidden');
+    return;
+  }
+
+  container.classList.remove('hidden');
+  const total = Number(status.total) || 0;
+  const completed = Number(status.completed) || 0;
+  if (status.state === 'running') {
+    const hasPercent = status.file_progress !== null
+      && status.file_progress !== undefined
+      && Number.isFinite(Number(status.file_progress));
+    if (hasPercent) {
+      const percent = Math.min(100, Math.max(0, Number(status.file_progress)));
+      const file = status.current_file ? `${status.current_file}: ` : '';
+      label.textContent = total > 1
+        ? `File ${Math.min(completed + 1, total)} of ${total} | ${file}${percent}%`
+        : `${file}${percent}%`;
+      bar.classList.remove('indeterminate');
+      bar.style.width = `${percent}%`;
+      track.setAttribute('aria-valuenow', String(percent));
+    } else {
+      const file = status.current_file ? `${status.current_file}: ` : '';
+      label.textContent = total > 1
+        ? `File ${Math.min(completed + 1, total)} of ${total} | ${file}Transcribing…`
+        : `${file}Transcribing…`;
+      bar.classList.add('indeterminate');
+      bar.style.width = '';
+      track.removeAttribute('aria-valuenow');
+    }
+  } else if (status.state === 'complete') {
+    label.textContent = 'Transcription complete';
+    bar.classList.remove('indeterminate');
+    bar.style.width = '100%';
+    track.setAttribute('aria-valuenow', '100');
+  } else if (status.state === 'failed') {
+    label.textContent = 'Transcription stopped';
+    bar.classList.remove('indeterminate');
+    const percent = status.file_progress === null || status.file_progress === undefined
+      ? 0 : Math.min(100, Math.max(0, Number(status.file_progress) || 0));
+    bar.style.width = `${percent}%`;
+    track.setAttribute('aria-valuenow', String(percent));
+  }
+}
+
 document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
   const btn = document.getElementById('transcribeBtn');
   const diarize = diarizeCk.checked;
@@ -2943,14 +3088,20 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
       renderMultiTranscriptions(state.transcriptions, {
         state:'running', completed:0, total:state.fileCount,
       });
-      let requestSettled = false;
-      const transcriptionRequest = api('/api/transcribe', requestOptions)
-        .then(data => ({data}), error => ({error}))
-        .finally(() => { requestSettled = true; });
+    }
+    updateTranscriptionProgress({
+      state:'running', completed:0, total:state.multifile ? state.fileCount : 1,
+    });
+    let requestSettled = false;
+    const transcriptionRequest = api('/api/transcribe', requestOptions)
+      .then(data => ({data}), error => ({error}))
+      .finally(() => { requestSettled = true; });
 
-      let lastCount = -1;
-      while (true) {
-        const progress = await api('/api/transcribe/status');
+    let lastCount = -1;
+    while (true) {
+      const progress = await api('/api/transcribe/status');
+      updateTranscriptionProgress(progress.status);
+      if (state.multifile) {
         const items = progress.transcriptions || [];
         if (items.length !== lastCount) {
           state.transcriptions = items;
@@ -2959,23 +3110,21 @@ document.getElementById('transcribeBtn').addEventListener('click', async ()=>{
         } else {
           updateMultiTranscriptionStatus(progress.status);
         }
-        if (progress.status.state === 'complete' || progress.status.state === 'failed') break;
-        if (requestSettled && progress.status.state === 'idle') {
-          const outcome = await transcriptionRequest;
-          if (outcome.error) throw outcome.error;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 30000));
       }
+      if (progress.status.state === 'complete' || progress.status.state === 'failed') break;
+      if (requestSettled && progress.status.state === 'idle') break;
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
 
-      const outcome = await transcriptionRequest;
-      if (outcome.error) throw outcome.error;
+    const outcome = await transcriptionRequest;
+    if (outcome.error) throw outcome.error;
+    if (state.multifile) {
       state.transcriptions = outcome.data.transcriptions || [];
       renderMultiTranscriptions(state.transcriptions, {
         state:'complete', completed:state.transcriptions.length, total:state.transcriptions.length,
       });
     } else {
-      const data = await api('/api/transcribe', requestOptions);
+      const data = outcome.data;
       state.transcriptions = [];
       state.segments = data.segments;
       document.getElementById('transcriptOut').value = data.transcript;
